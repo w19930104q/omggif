@@ -811,5 +811,602 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
   return output;
 }
 
+// ---------------------------------------------------------------------------
+// Streaming / incremental GIF decoding.
+//
+// GifStreamReader is a push-based counterpart to GifReader: instead of
+// requiring the entire GIF file in memory up front, bytes are fed in chunks
+// (for example as they arrive from the network or are read from disk).
+// Header parsing, LZW decompression and canvas compositing all advance
+// incrementally, frame by frame.  Only unconsumed input bytes are retained,
+// so peak memory stays bounded by the canvas, one frame's pixel indices and
+// the LZW dictionary -- independent of the total file size.
+//
+// Usage:
+//   var reader = new GifStreamReader();
+//   reader.onheader = function(header) { ... };   // width/height/palette
+//   reader.onframe = function(frame, frame_pixels, canvas) { ... };
+//   reader.onend = function() { ... };
+//   reader.push(chunk);  // Uint8Array (or Buffer), as data becomes available
+//   reader.finish();     // Signal end of input.
+//
+// onframe is called once per frame after it has been fully decoded.
+// |frame_pixels| holds the frame blitted onto a transparent canvas-sized
+// buffer, byte-for-byte identical to what GifReader's
+// decodeAndBlitFrameRGBA() produces into a zeroed buffer (or
+// decodeAndBlitFrameBGRA() when constructed with {format: 'bgra'}).
+// |canvas| is the running animation composite with frame disposal applied
+// (disposal 2 restores to transparent, as browsers do).  Both pixel buffers
+// are owned by the reader and reused between frames, so copy them if they
+// need to be retained.  |frame| carries the same per-frame fields as
+// GifReader's frameInfo() (plus an |index| and the resolved |palette|).
+//
+// Errors are delivered to onerror if assigned, otherwise thrown from push().
+
+// Incremental LZW decoder.  Decodes the GIF LZW code stream (including its
+// sub-block framing) byte by byte into |output|, producing exactly the same
+// index stream as GifReaderLZWOutputIndexStream.  run() consumes as much of
+// [p, stream_end) as it can and returns the new position; the |done| flag is
+// set once the image data (through the sub-block terminator) is finished.
+function GifStreamLZWDecoder(output) {
+  this.output = output;
+  this.output_length = output.length;
+  this.op = 0;
+  this.done = false;
+  this.overflow = false;
+  this.phase = 0;  // 0: min code size, 1: code stream, 2: drain sub-blocks.
+  this.subblock_size = -1;  // -1: the next byte is a sub-block size.
+  this.code_table = null;
+}
+
+GifStreamLZWDecoder.prototype.run = function(stream, p, stream_end) {
+  while (true) {
+    if (this.phase === 0) {  // Read the minimum code size byte.
+      if (p >= stream_end) return p;
+      var min_code_size = stream[p++];
+      this.min_code_size = min_code_size;
+      this.clear_code = 1 << min_code_size;
+      this.eoi_code = this.clear_code + 1;
+      this.next_code = this.eoi_code + 1;
+      this.cur_code_size = min_code_size + 1;
+      this.code_mask = (1 << this.cur_code_size) - 1;
+      this.cur_shift = 0;
+      this.cur = 0;
+      this.prev_code = null;
+      this.code_table = new Int32Array(4096);  // 12-bit prefix + 8-bit suffix.
+      this.phase = 1;
+      continue;
+    }
+
+    if (this.phase === 2) {  // Drain any remaining sub-blocks after EOI.
+      while (true) {
+        if (this.subblock_size === 0) {  // Terminator consumed, fully done.
+          if (!this.overflow && this.op !== this.output_length)
+            console.log("Warning, gif stream shorter than expected.");
+          this.done = true;
+          return p;
+        }
+        if (this.subblock_size === -1) {
+          if (p >= stream_end) return p;
+          this.subblock_size = stream[p++];
+          continue;
+        }
+        if (p >= stream_end) return p;
+        var skip = this.subblock_size < (stream_end - p) ?
+            this.subblock_size : stream_end - p;
+        p += skip;
+        this.subblock_size -= skip;
+        if (this.subblock_size === 0) this.subblock_size = -1;
+      }
+    }
+
+    // Phase 1: decode codes.  Fill the bit buffer with the same discipline
+    // as GifReaderLZWOutputIndexStream (always hold up to 16 bits).
+    while (this.cur_shift < 16) {
+      if (this.subblock_size === 0) break;  // Terminator reached.
+      if (this.subblock_size === -1) {
+        if (p >= stream_end) return p;
+        this.subblock_size = stream[p++];
+        continue;
+      }
+      if (p >= stream_end) return p;
+      this.cur |= stream[p++] << this.cur_shift;
+      this.cur_shift += 8;
+      if (--this.subblock_size === 0) this.subblock_size = -1;
+    }
+
+    if (this.cur_shift < this.cur_code_size) {
+      // Ran out of input bits at the terminator, the same end condition as
+      // the whole-file decoder running out of sub-block data.
+      if (!this.overflow && this.op !== this.output_length)
+        console.log("Warning, gif stream shorter than expected.");
+      this.done = true;
+      return p;
+    }
+
+    var code = this.cur & this.code_mask;
+    this.cur >>= this.cur_code_size;
+    this.cur_shift -= this.cur_code_size;
+
+    if (code === this.clear_code) {
+      this.next_code = this.eoi_code + 1;
+      this.cur_code_size = this.min_code_size + 1;
+      this.code_mask = (1 << this.cur_code_size) - 1;
+      this.prev_code = null;
+      continue;
+    }
+
+    if (code === this.eoi_code) {
+      this.phase = 2;  // Consume the rest of the sub-block chain.
+      continue;
+    }
+
+    // See GifReaderLZWOutputIndexStream for an explanation of the code table
+    // (12-bit prefix code + 8-bit suffix byte per entry) and the chasing.
+    var chase_code = code < this.next_code ? code : this.prev_code;
+
+    var chase_length = 0;
+    var chase = chase_code;
+    var code_table = this.code_table;
+    while (chase > this.clear_code) {
+      chase = code_table[chase] >> 8;
+      ++chase_length;
+    }
+
+    var k = chase;
+    var op = this.op;
+    var op_end = op + chase_length + (chase_code !== code ? 1 : 0);
+    if (op_end > this.output_length) {
+      console.log("Warning, gif stream longer than expected.");
+      this.overflow = true;
+      this.phase = 2;
+      continue;
+    }
+
+    var output = this.output;
+    output[op++] = k;
+
+    op += chase_length;
+    var b = op;  // Track pointer, writing backwards.
+
+    if (chase_code !== code)  // The case of emitting {CODE-1} + k.
+      output[op++] = k;
+
+    chase = chase_code;
+    while (chase_length--) {
+      chase = code_table[chase];
+      output[--b] = chase & 0xff;  // Write backwards.
+      chase >>= 8;  // Pull down to the prefix code.
+    }
+    this.op = op;
+
+    if (this.prev_code !== null && this.next_code < 4096) {
+      code_table[this.next_code++] = this.prev_code << 8 | k;
+      if (this.next_code >= this.code_mask + 1 && this.cur_code_size < 12) {
+        ++this.cur_code_size;
+        this.code_mask = this.code_mask << 1 | 1;
+      }
+    }
+
+    this.prev_code = code;
+  }
+};
+
+function GifStreamReader(opts) {
+  opts = opts === undefined ? { } : opts;
+  var bgra = opts.format === 'bgra';
+
+  var self = this;
+
+  // Event handlers, assign as needed (see the documentation above).
+  this.onheader = null;
+  this.onframe = null;
+  this.onend = null;
+  this.onerror = null;
+
+  this.width = 0;
+  this.height = 0;
+  this.loopCount = null;  // null until a Netscape looping block is seen.
+  this.framesDecoded = 0;
+
+  // Parser states.
+  var ST_HEADER = 0, ST_LSD = 1, ST_GCT = 2, ST_BLOCK = 3, ST_EXT = 4,
+      ST_GCE = 5, ST_APP = 6, ST_APP_DATA = 7, ST_SKIP_SUBBLOCKS = 8,
+      ST_IMG_DESC = 9, ST_LCT = 10, ST_IMG_DATA = 11, ST_END = 12;
+
+  // Input buffer.  Only bytes not yet consumed are retained, so this stays
+  // on the order of the pushed chunk size regardless of the file size.
+  var ibuf = new Uint8Array(1 << 16);
+  var ipos = 0;
+  var iend = 0;
+
+  var state = ST_HEADER;
+
+  // Logical screen.
+  var width = 0;
+  var height = 0;
+  var background = 0;
+  var global_palette = null;  // Uint8Array of RGB triplets (a private copy).
+  var gct_size = 0;
+
+  // Graphics control state.  Sticky until replaced by another Graphics
+  // Control Extension, matching GifReader's behavior.
+  var delay = 0;
+  var transparent_index = null;
+  var disposal = 0;
+
+  // Current frame.
+  var frame = null;
+  var frame_palette = null;
+  var lct_size = 0;
+  var index_stream = null;
+  var lzw = null;
+
+  // Output buffers (allocated from the header, reused between frames).
+  var canvas = null;        // Animation composite (disposal applied).
+  var frame_pixels = null;  // Raw per-frame blit.
+  var prev_rect = null;     // Rect + disposal of the previously composited frame.
+  var saved_rect = null;    // Saved canvas contents for disposal 3.
+  var saved_rect_dims = null;
+
+  var end_fired = false;
+
+  function fire_header() {
+    if (self.onheader !== null) {
+      self.onheader({width: width, height: height, background: background,
+                     globalPalette: global_palette});
+    }
+  }
+
+  function fire_end() {
+    if (end_fired) return;
+    end_fired = true;
+    if (self.onend !== null) self.onend();
+  }
+
+  // Blit the current frame into |out| (canvas-sized RGBA/BGRA).  Mirrors
+  // GifReader's decodeAndBlitFrameRGBA/BGRA exactly (including interlacing),
+  // except the palette is read from a private copy rather than the file.
+  function blit_frame(out) {
+    var num_pixels = frame.width * frame.height;
+    var palette = frame_palette;
+
+    var trans = frame.transparent_index;
+    if (trans === null) trans = 256;
+
+    // Subrect within the canvas, skip the remaining pixels after a scanline.
+    var framewidth  = frame.width;
+    var framestride = width - framewidth;
+    var xleft       = framewidth;
+
+    var opbeg = ((frame.y * width) + frame.x) * 4;
+    var opend = ((frame.y + frame.height) * width + frame.x) * 4;
+    var op    = opbeg;
+
+    var scanstride = framestride * 4;
+    if (frame.interlaced === true) {
+      scanstride += width * 4 * 7;  // Pass 1.
+    }
+    var interlaceskip = 8;
+
+    for (var i = 0; i < num_pixels; ++i) {
+      var index = index_stream[i];
+
+      if (xleft === 0) {  // Beginning of new scan line.
+        op += scanstride;
+        xleft = framewidth;
+        if (op >= opend) {  // Wrap to switch passes when interlacing.
+          scanstride = framestride * 4 + width * 4 * (interlaceskip-1);
+          op = opbeg + (framewidth + framestride) * (interlaceskip << 1);
+          interlaceskip >>= 1;
+        }
+      }
+
+      if (index === trans || palette === null) {
+        op += 4;
+      } else {
+        var r = palette[index * 3];
+        var g = palette[index * 3 + 1];
+        var b = palette[index * 3 + 2];
+        if (bgra) {
+          out[op++] = b; out[op++] = g; out[op++] = r;
+        } else {
+          out[op++] = r; out[op++] = g; out[op++] = b;
+        }
+        out[op++] = 255;
+      }
+      --xleft;
+    }
+  }
+
+  function clear_canvas_rect(rect) {  // Disposal 2: restore to transparent.
+    var x1 = Math.min(rect.x + rect.width, width);
+    var y1 = Math.min(rect.y + rect.height, height);
+    for (var row = rect.y; row < y1; ++row) {
+      var o = (row * width + rect.x) * 4;
+      canvas.fill(0, o, o + (x1 - rect.x) * 4);
+    }
+  }
+
+  function save_canvas_rect(rect) {  // Disposal 3: snapshot before blit.
+    var w = Math.min(rect.width, width - rect.x);
+    var h = Math.min(rect.height, height - rect.y);
+    if (w <= 0 || h <= 0) { saved_rect_dims = null; return; }
+    saved_rect = new Uint8Array(w * h * 4);
+    for (var row = 0; row < h; ++row) {
+      var o = ((rect.y + row) * width + rect.x) * 4;
+      saved_rect.set(canvas.subarray(o, o + w * 4), row * w * 4);
+    }
+    saved_rect_dims = {x: rect.x, y: rect.y, width: w, height: h};
+  }
+
+  function restore_canvas_rect() {
+    var d = saved_rect_dims;
+    for (var row = 0; row < d.height; ++row) {
+      canvas.set(saved_rect.subarray(row * d.width * 4, (row+1) * d.width * 4),
+                 ((d.y + row) * width + d.x) * 4);
+    }
+  }
+
+  function finish_frame() {
+    // Raw per-frame blit, identical to decodeAndBlitFrameRGBA/BGRA into a
+    // freshly zeroed buffer.
+    frame_pixels.fill(0);
+    blit_frame(frame_pixels);
+
+    // Composite onto the animation canvas, applying the previous frame's
+    // disposal method first.
+    if (prev_rect !== null) {
+      if (prev_rect.disposal === 2) {
+        clear_canvas_rect(prev_rect);
+      } else if (prev_rect.disposal === 3 && saved_rect_dims !== null) {
+        restore_canvas_rect();
+      }
+    }
+    if (frame.disposal === 3) save_canvas_rect(frame);
+    blit_frame(canvas);
+    prev_rect = {x: frame.x, y: frame.y, width: frame.width,
+                 height: frame.height, disposal: frame.disposal};
+
+    ++self.framesDecoded;
+    var f = frame;
+    // Release per-frame decode state before invoking the callback.
+    frame = null; frame_palette = null; index_stream = null; lzw = null;
+    if (self.onframe !== null) self.onframe(f, frame_pixels, canvas);
+  }
+
+  function start_image_data() {
+    frame.palette = frame_palette;
+    index_stream = new Uint8Array(frame.width * frame.height);
+    lzw = new GifStreamLZWDecoder(index_stream);
+    state = ST_IMG_DATA;
+  }
+
+  function parse() {
+    while (state !== ST_END) {
+      var avail = iend - ipos;
+      switch (state) {
+        case ST_HEADER: {  // GIF87a or GIF89a.
+          if (avail < 6) return;
+          if (ibuf[ipos  ] !== 0x47 || ibuf[ipos+1] !== 0x49 ||
+              ibuf[ipos+2] !== 0x46 || ibuf[ipos+3] !== 0x38 ||
+              (ibuf[ipos+4]+1 & 0xfd) !== 0x38 || ibuf[ipos+5] !== 0x61) {
+            throw new Error("Invalid GIF 87a/89a header.");
+          }
+          ipos += 6;
+          state = ST_LSD;
+          break;
+        }
+
+        case ST_LSD: {  // Logical Screen Descriptor.
+          if (avail < 7) return;
+          width = ibuf[ipos] | ibuf[ipos+1] << 8;
+          height = ibuf[ipos+2] | ibuf[ipos+3] << 8;
+          var pf0 = ibuf[ipos+4];
+          background = ibuf[ipos+5];
+          ipos += 7;
+          self.width = width;
+          self.height = height;
+          canvas = new Uint8Array(width * height * 4);
+          frame_pixels = new Uint8Array(width * height * 4);
+          if (pf0 >> 7) {  // Global Color Table Flag.
+            gct_size = 3 * (1 << ((pf0 & 0x7) + 1));
+            state = ST_GCT;
+          } else {
+            fire_header();
+            state = ST_BLOCK;
+          }
+          break;
+        }
+
+        case ST_GCT: {  // Global Color Table.
+          if (avail < gct_size) return;
+          global_palette = ibuf.slice(ipos, ipos + gct_size);
+          ipos += gct_size;
+          fire_header();
+          state = ST_BLOCK;
+          break;
+        }
+
+        case ST_BLOCK: {  // Block introducer.
+          if (avail < 1) return;
+          var introducer = ibuf[ipos++];
+          if (introducer === 0x21) {  // Extension.
+            state = ST_EXT;
+          } else if (introducer === 0x2c) {  // Image Descriptor.
+            state = ST_IMG_DESC;
+          } else if (introducer === 0x3b) {  // Trailer Marker.
+            state = ST_END;
+          } else {
+            throw new Error("Unknown gif block: 0x" + introducer.toString(16));
+          }
+          break;
+        }
+
+        case ST_EXT: {  // Extension label.
+          if (avail < 1) return;
+          var label = ibuf[ipos++];
+          if (label === 0xf9) {  // Graphics Control Extension.
+            state = ST_GCE;
+          } else if (label === 0xff) {  // Application Extension.
+            state = ST_APP;
+          } else if (label === 0xfe || label === 0x01) {  // Comment/Plain Text.
+            state = ST_SKIP_SUBBLOCKS;
+          } else {
+            throw new Error(
+                "Unknown graphic control label: 0x" + label.toString(16));
+          }
+          break;
+        }
+
+        case ST_GCE: {  // Graphics Control Extension.
+          if (avail < 6) return;
+          if (ibuf[ipos] !== 0x4 || ibuf[ipos+5] !== 0)
+            throw new Error("Invalid graphics extension block.");
+          var pf1 = ibuf[ipos+1];
+          delay = ibuf[ipos+2] | ibuf[ipos+3] << 8;
+          transparent_index = ibuf[ipos+4];
+          if ((pf1 & 1) === 0) transparent_index = null;
+          disposal = pf1 >> 2 & 0x7;
+          ipos += 6;
+          state = ST_BLOCK;
+          break;
+        }
+
+        case ST_APP: {  // Application Extension identifier.
+          if (avail < 12) return;
+          // Check for a Netscape looping extension ("NETSCAPE2.0").
+          if (ibuf[ipos   ] === 0x0b &&
+              ibuf[ipos+1 ] === 0x4e && ibuf[ipos+2 ] === 0x45 &&
+              ibuf[ipos+3 ] === 0x54 && ibuf[ipos+4 ] === 0x53 &&
+              ibuf[ipos+5 ] === 0x43 && ibuf[ipos+6 ] === 0x41 &&
+              ibuf[ipos+7 ] === 0x50 && ibuf[ipos+8 ] === 0x45 &&
+              ibuf[ipos+9 ] === 0x32 && ibuf[ipos+10] === 0x2e &&
+              ibuf[ipos+11] === 0x30) {
+            state = ST_APP_DATA;  // Expect 03 01 <loop lo> <loop hi> 00.
+          } else {  // Unknown application, skip its sub-blocks.
+            ipos += 12;
+            state = ST_SKIP_SUBBLOCKS;
+          }
+          break;
+        }
+
+        case ST_APP_DATA: {  // Netscape looping sub-block.
+          if (avail < 17) return;
+          if (ibuf[ipos+12] === 0x03 && ibuf[ipos+13] === 0x01 &&
+              ibuf[ipos+16] === 0x00) {
+            self.loopCount = ibuf[ipos+14] | ibuf[ipos+15] << 8;
+            ipos += 17;
+            state = ST_BLOCK;
+          } else {  // Not the expected sub-block, skip like an unknown app.
+            ipos += 12;
+            state = ST_SKIP_SUBBLOCKS;
+          }
+          break;
+        }
+
+        case ST_SKIP_SUBBLOCKS: {  // Skip a chain of data sub-blocks.
+          while (true) {
+            if (iend - ipos < 1) return;
+            var block_size = ibuf[ipos];
+            if (block_size === 0) {  // 0 size is the terminator.
+              ++ipos;
+              state = ST_BLOCK;
+              break;
+            }
+            if (iend - ipos < 1 + block_size) return;
+            ipos += 1 + block_size;
+          }
+          break;
+        }
+
+        case ST_IMG_DESC: {  // Image Descriptor.
+          if (avail < 9) return;
+          var fx = ibuf[ipos  ] | ibuf[ipos+1] << 8;
+          var fy = ibuf[ipos+2] | ibuf[ipos+3] << 8;
+          var fw = ibuf[ipos+4] | ibuf[ipos+5] << 8;
+          var fh = ibuf[ipos+6] | ibuf[ipos+7] << 8;
+          var pf2 = ibuf[ipos+8];
+          ipos += 9;
+          frame = {index: self.framesDecoded,
+                   x: fx, y: fy, width: fw, height: fh,
+                   has_local_palette: (pf2 >> 7) !== 0,
+                   transparent_index: transparent_index,
+                   interlaced: (pf2 >> 6 & 1) !== 0,
+                   delay: delay,
+                   disposal: disposal};
+          if (frame.has_local_palette) {
+            lct_size = 3 * (1 << ((pf2 & 0x7) + 1));
+            state = ST_LCT;
+          } else {
+            frame_palette = global_palette;
+            start_image_data();
+          }
+          break;
+        }
+
+        case ST_LCT: {  // Local Color Table.
+          if (avail < lct_size) return;
+          frame_palette = ibuf.slice(ipos, ipos + lct_size);
+          ipos += lct_size;
+          start_image_data();
+          break;
+        }
+
+        case ST_IMG_DATA: {  // LZW code stream (sub-block framed).
+          ipos = lzw.run(ibuf, ipos, iend);
+          if (lzw.done !== true) return;  // Need more input.
+          finish_frame();
+          state = ST_BLOCK;
+          break;
+        }
+      }
+    }
+    fire_end();
+  }
+
+  // Feed the next chunk of GIF data (a Uint8Array or Buffer).
+  this.push = function(chunk) {
+    if (state === ST_END || chunk.length === 0) return;
+    // Compact consumed bytes and make room for the new chunk.
+    if (ipos > 0) {
+      ibuf.copyWithin(0, ipos, iend);
+      iend -= ipos;
+      ipos = 0;
+    }
+    if (iend + chunk.length > ibuf.length) {
+      var capacity = ibuf.length * 2;
+      if (capacity < iend + chunk.length) capacity = iend + chunk.length;
+      var nbuf = new Uint8Array(capacity);
+      nbuf.set(ibuf.subarray(0, iend), 0);
+      ibuf = nbuf;
+    }
+    ibuf.set(chunk, iend);
+    iend += chunk.length;
+    try {
+      parse();
+    } catch (e) {
+      if (self.onerror !== null) { self.onerror(e); return; }
+      throw e;
+    }
+    if (ipos === iend) ipos = iend = 0;  // Fully consumed, reset.
+  };
+
+  // Signal that no more input will be pushed.
+  this.finish = function() {
+    if (end_fired) return;
+    if (state !== ST_END && state !== ST_BLOCK) {
+      var err = new Error("Truncated GIF file.");
+      if (self.onerror !== null) { self.onerror(err); return; }
+      throw err;
+    }
+    fire_end();
+  };
+}
+
 // CommonJS.
-try { exports.GifWriter = GifWriter; exports.GifReader = GifReader } catch(e) {}
+try {
+  exports.GifWriter = GifWriter;
+  exports.GifReader = GifReader;
+  exports.GifStreamReader = GifStreamReader;
+} catch(e) {}

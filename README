@@ -3,7 +3,40 @@ omggif is a JavaScript implementation of a GIF 89a encoder and decoder.
 https://github.com/deanm/omggif
 
 
-(c) Dean McNamee <dean@gmail.com>, 2013.
+Decoding
+========
+
+GifReader decodes from a buffer holding the entire file:
+
+    var reader = new omggif.GifReader(buffer);
+    var pixels = new Uint8Array(reader.width * reader.height * 4);
+    reader.decodeAndBlitFrameRGBA(0, pixels);
+
+GifStreamReader decodes incrementally as bytes arrive (network, disk, ...),
+so peak memory stays bounded by the canvas and a single frame rather than
+the whole file.  Header parsing, LZW decompression and canvas compositing
+all advance frame by frame:
+
+    var reader = new omggif.GifStreamReader();  // or {format: 'bgra'}
+    reader.onheader = function(header) { ... };
+    reader.onframe = function(frame, framePixels, canvas) {
+      // framePixels: this frame blitted onto a transparent canvas-sized
+      // buffer, identical to decodeAndBlitFrameRGBA into a zeroed buffer.
+      // canvas: the running animation composite with disposal applied.
+      // Both buffers are reused between frames -- copy to retain them.
+    };
+    reader.onend = function() { ... };
+    reader.push(chunk);  // Uint8Array/Buffer, as data becomes available
+    reader.finish();     // Signal end of input
+
+Run the streaming acceptance test (frame-hash equality against the
+whole-file decoder plus a peak-memory comparison on a long GIF):
+
+    node test_streaming.js
+
+
+License
+=======(c) Dean McNamee <dean@gmail.com>, 2013.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to
