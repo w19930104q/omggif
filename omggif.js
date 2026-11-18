@@ -26,6 +26,33 @@
 
 "use strict";
 
+// Error categories used to classify GIF parsing / decoding failures.  All
+// errors thrown by GifReader (and the frame decode paths) are GifError
+// instances carrying one of these categories plus a byte |offset| into the
+// input buffer where the problem was detected.
+var GifErrorCategory = {
+  BAD_HEADER: 'bad_header',  // Not a GIF 87a/89a signature.
+  TRUNCATED: 'truncated',  // Stream ended before the current structure.
+  LZW_OVERFLOW: 'lzw_overflow',  // LZW data decodes to more pixels than fit.
+  UNSUPPORTED_EXTENSION: 'unsupported_extension',  // Unknown extension label.
+  MALFORMED: 'malformed'  // Structurally invalid block (sizes, markers, etc).
+};
+
+function GifError(category, offset, message) {
+  this.name = 'GifError';
+  this.category = category;
+  this.offset = offset;
+  this.message = message + ' [category: ' + category + ', offset: ' +
+                 offset + ']';
+  if (Error.captureStackTrace) {  // V8 (Node, Chrome).
+    Error.captureStackTrace(this, GifError);
+  } else {
+    this.stack = (new Error(this.message)).stack;
+  }
+}
+GifError.prototype = Object.create(Error.prototype);
+GifError.prototype.constructor = GifError;
+
 function GifWriter(buf, width, height, gopts) {
   var p = 0;
 
@@ -366,13 +393,45 @@ function GifWriterOutputLZWCodeStream(buf, p, min_code_size, index_stream) {
 function GifReader(buf) {
   var p = 0;
 
+  // Decode state machine state.  Truncation errors are categorized together
+  // with the parser state in which the stream ran out of data.
+  var state = 'header';
+
+  function fail(category, offset, message) {
+    throw new GifError(category, offset, message);
+  }
+
+  // Require |n| bytes to be available at the current parse position.
+  function need(n) {
+    if (p + n > buf.length) {
+      fail(GifErrorCategory.TRUNCATED, p,
+           'Truncated GIF stream in state "' + state + '" (needed ' + n +
+           ' byte(s) at offset ' + p + ', buffer length ' + buf.length + ')');
+    }
+  }
+
+  // Seek through a run of data sub-blocks (used by several extensions and by
+  // the image data), checking bounds as we go.
+  function skip_sub_blocks() {
+    while (true) {
+      need(1);
+      var block_size = buf[p++];
+      if (block_size === 0) break;  // 0 size is terminator.
+      need(block_size);
+      p += block_size;
+    }
+  }
+
   // - Header (GIF87a or GIF89a).
+  need(6);
   if (buf[p++] !== 0x47 ||            buf[p++] !== 0x49 || buf[p++] !== 0x46 ||
       buf[p++] !== 0x38 || (buf[p++]+1 & 0xfd) !== 0x38 || buf[p++] !== 0x61) {
-    throw new Error("Invalid GIF 87a/89a header.");
+    fail(GifErrorCategory.BAD_HEADER, 0, 'Invalid GIF 87a/89a header.');
   }
 
   // - Logical Screen Descriptor.
+  state = 'logical_screen_descriptor';
+  need(7);
   var width = buf[p++] | buf[p++] << 8;
   var height = buf[p++] | buf[p++] << 8;
   var pf0 = buf[p++];  // <Packed Fields>.
@@ -386,6 +445,8 @@ function GifReader(buf) {
   var global_palette_size   = null;
 
   if (global_palette_flag) {
+    state = 'global_palette';
+    need(num_global_colors * 3);
     global_palette_offset = p;
     global_palette_size = num_global_colors;
     p += num_global_colors * 3;  // Seek past palette.
@@ -403,12 +464,18 @@ function GifReader(buf) {
   this.width = width;
   this.height = height;
 
-  while (no_eof && p < buf.length) {
+  state = 'block';
+  while (no_eof) {
+    need(1);  // Block introducer (also catches a missing trailer).
     switch (buf[p++]) {
-      case 0x21:  // Graphics Control Extension Block
+      case 0x21:  // Extension Block
+        state = 'extension';
+        need(1);
         switch (buf[p++]) {
           case 0xff:  // Application specific block
+            state = 'application_extension';
             // Try if it's a Netscape block (with animation loop counter).
+            if (buf[p] === 0x0b) need(17);  // Reads up to buf[p+16] below.
             if (buf[p   ] !== 0x0b ||  // 21 FF already read, check block size.
                 // NETSCAPE2.0
                 buf[p+1 ] == 0x4e && buf[p+2 ] == 0x45 && buf[p+3 ] == 0x54 &&
@@ -417,24 +484,23 @@ function GifReader(buf) {
                 buf[p+10] == 0x2e && buf[p+11] == 0x30 &&
                 // Sub-block
                 buf[p+12] == 0x03 && buf[p+13] == 0x01 && buf[p+16] == 0) {
+              need(17);  // The whole Netscape block must be present.
               p += 14;
               loop_count = buf[p++] | buf[p++] << 8;
               p++;  // Skip terminator.
             } else {  // We don't know what it is, just try to get past it.
+              need(12);
               p += 12;
-              while (true) {  // Seek through subblocks.
-                var block_size = buf[p++];
-                // Bad block size (ex: undefined from an out of bounds read).
-                if (!(block_size >= 0)) throw Error("Invalid block size");
-                if (block_size === 0) break;  // 0 size is terminator
-                p += block_size;
-              }
+              skip_sub_blocks();
             }
             break;
 
           case 0xf9:  // Graphics Control Extension
+            state = 'graphics_control_extension';
+            need(6);
             if (buf[p++] !== 0x4 || buf[p+4] !== 0)
-              throw new Error("Invalid graphics extension block.");
+              fail(GifErrorCategory.MALFORMED, p - 1,
+                   'Invalid graphics extension block.');
             var pf1 = buf[p++];
             delay = buf[p++] | buf[p++] << 8;
             transparent_index = buf[p++];
@@ -447,24 +513,25 @@ function GifReader(buf) {
           // to parse past it.  It follows the block structure of the comment
           // extension enough to reuse the path to skip through the blocks.
           case 0x01:  // Plain Text Extension (fallthrough to Comment Extension)
+            state = 'plain_text_extension';
+            skip_sub_blocks();
+            break;
+
           case 0xfe:  // Comment Extension.
-            while (true) {  // Seek through subblocks.
-              var block_size = buf[p++];
-              // Bad block size (ex: undefined from an out of bounds read).
-              if (!(block_size >= 0)) throw Error("Invalid block size");
-              if (block_size === 0) break;  // 0 size is terminator
-              // console.log(buf.slice(p, p+block_size).toString('ascii'));
-              p += block_size;
-            }
+            state = 'comment_extension';
+            skip_sub_blocks();
             break;
 
           default:
-            throw new Error(
-                "Unknown graphic control label: 0x" + buf[p-1].toString(16));
+            fail(GifErrorCategory.UNSUPPORTED_EXTENSION, p - 1,
+                 'Unknown graphic control label: 0x' + buf[p-1].toString(16));
         }
+        state = 'block';
         break;
 
       case 0x2c:  // Image Descriptor.
+        state = 'image_descriptor';
+        need(9);
         var x = buf[p++] | buf[p++] << 8;
         var y = buf[p++] | buf[p++] << 8;
         var w = buf[p++] | buf[p++] << 8;
@@ -479,21 +546,19 @@ function GifReader(buf) {
         var has_local_palette = false;
         if (local_palette_flag) {
           var has_local_palette = true;
+          state = 'local_palette';
+          need(num_local_colors * 3);
           palette_offset = p;  // Override with local palette.
           palette_size = num_local_colors;
           p += num_local_colors * 3;  // Seek past palette.
         }
 
+        state = 'image_data';
+        need(1);
         var data_offset = p;
 
         p++;  // codesize
-        while (true) {
-          var block_size = buf[p++];
-          // Bad block size (ex: undefined from an out of bounds read).
-          if (!(block_size >= 0)) throw Error("Invalid block size");
-          if (block_size === 0) break;  // 0 size is terminator
-          p += block_size;
-        }
+        skip_sub_blocks();
 
         frames.push({x: x, y: y, width: w, height: h,
                      has_local_palette: has_local_palette,
@@ -505,6 +570,7 @@ function GifReader(buf) {
                      interlaced: !!interlace_flag,
                      delay: delay,
                      disposal: disposal});
+        state = 'block';
         break;
 
       case 0x3b:  // Trailer Marker (end of file).
@@ -512,8 +578,8 @@ function GifReader(buf) {
         break;
 
       default:
-        throw new Error("Unknown gif block: 0x" + buf[p-1].toString(16));
-        break;
+        fail(GifErrorCategory.MALFORMED, p - 1,
+             'Unknown gif block: 0x' + buf[p-1].toString(16));
     }
   }
 
@@ -668,7 +734,14 @@ function GifReader(buf) {
 }
 
 function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
+  if (p >= code_stream.length)
+    throw new GifError(GifErrorCategory.TRUNCATED, p,
+                       'Truncated LZW stream: missing min code size byte.');
   var min_code_size = code_stream[p++];
+
+  if (min_code_size < 2 || min_code_size > 8)
+    throw new GifError(GifErrorCategory.MALFORMED, p - 1,
+                       'Invalid LZW min code size: ' + min_code_size);
 
   var clear_code = 1 << min_code_size;
   var eoi_code = clear_code + 1;
@@ -683,6 +756,9 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
 
   var op = 0;  // Output pointer.
 
+  if (p >= code_stream.length)
+    throw new GifError(GifErrorCategory.TRUNCATED, p,
+                       'Truncated LZW stream: missing sub-block size.');
   var subblock_size = code_stream[p++];
 
   // TODO(deanm): Would using a TypedArray be any faster?  At least it would
@@ -692,23 +768,31 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
 
   var prev_code = null;  // Track code-1.
 
+  var finished = false;  // Set when the EOI code terminates the stream.
+
   while (true) {
     // Read up to two bytes, making sure we always 12-bits for max sized code.
     while (cur_shift < 16) {
       if (subblock_size === 0) break;  // No more data to be read.
 
+      if (p >= code_stream.length)
+        throw new GifError(GifErrorCategory.TRUNCATED, p,
+                           'Truncated LZW stream: ran out of data.');
+
       cur |= code_stream[p++] << cur_shift;
       cur_shift += 8;
 
       if (subblock_size === 1) {  // Never let it get to 0 to hold logic above.
-        subblock_size = code_stream[p++];  // Next subblock.
+        if (p >= code_stream.length)
+          throw new GifError(GifErrorCategory.TRUNCATED, p,
+                             'Truncated LZW stream: missing sub-block size.');
+        subblock_size = code_stream[p++];
       } else {
         --subblock_size;
       }
     }
 
-    // TODO(deanm): We should never really get here, we should have received
-    // and EOI.
+    // The stream ran out of data before an EOI code was seen.
     if (cur_shift < cur_code_size)
       break;
 
@@ -732,6 +816,7 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
       prev_code = null;
       continue;
     } else if (code === eoi_code) {
+      finished = true;
       break;
     }
 
@@ -768,8 +853,10 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
 
     var op_end = op + chase_length + (chase_code !== code ? 1 : 0);
     if (op_end > output_length) {
-      console.log("Warning, gif stream longer than expected.");
-      return;
+      throw new GifError(
+          GifErrorCategory.LZW_OVERFLOW, p,
+          'LZW stream overflows the frame (' + op_end + ' pixels decoded of ' +
+          output_length + ' expected)');
     }
 
     // Already have the first byte from the chase, might as well write it fast.
@@ -805,6 +892,14 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
   }
 
   if (op !== output_length) {
+    if (finished === false) {
+      // The stream ended (no more data, no EOI) before filling the frame.
+      throw new GifError(
+          GifErrorCategory.TRUNCATED, p,
+          'Truncated LZW stream: decoded ' + op + ' of ' + output_length +
+          ' pixels before the stream ended');
+    }
+    // EOI arrived before the frame was full; tolerate as before.
     console.log("Warning, gif stream shorter than expected.");
   }
 
@@ -812,4 +907,9 @@ function GifReaderLZWOutputIndexStream(code_stream, p, output, output_length) {
 }
 
 // CommonJS.
-try { exports.GifWriter = GifWriter; exports.GifReader = GifReader } catch(e) {}
+try {
+  exports.GifWriter = GifWriter;
+  exports.GifReader = GifReader;
+  exports.GifError = GifError;
+  exports.GifErrorCategory = GifErrorCategory;
+} catch(e) {}

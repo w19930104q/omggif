@@ -22,3 +22,26 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 IN THE SOFTWARE.
+
+
+Error classification
+--------------------
+
+Parse and decode failures thrown by GifReader (and its frame decode methods)
+are GifError instances (a subclass of Error) carrying two extra fields:
+
+  - category: one of the GifErrorCategory strings
+      'bad_header'             not a GIF 87a/89a signature
+      'truncated'              the stream ended before the current structure
+                               (the message names the decoder state machine
+                               state in which the data ran out)
+      'lzw_overflow'           the LZW stream decodes to more pixels than the
+                               frame holds
+      'unsupported_extension'  an unknown extension label was encountered
+      'malformed'              a structurally invalid block (bad sizes,
+                               markers, LZW min code size, etc)
+  - offset: the byte offset into the input buffer where the problem was
+    detected.
+
+See test/error_classification.js for a malformed-sample acceptance matrix
+(run it with: node test/error_classification.js).
